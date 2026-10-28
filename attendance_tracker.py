@@ -1,96 +1,203 @@
-import os
+"""Attendance tracker with improved security, reliability, and style."""
+
 import csv
-import ssl
-import json
-import subprocess
+import os
+import zipfile
 from datetime import datetime
+
 import requests
 
-# Global attendance register
+
 students = {}
 ERP_URL = "https://erp.college.example/api/attendance"
-ERP_API_KEY = "erp-live-4f9c2a7d81"
 MIN_ATTENDANCE = 75
 
-def addStudent(roll_no, name, section="A"):
-    students[roll_no] = {"name": name, "section": section, "records": []}
 
-def markAttendance(roll_no, date, status, register={}):
+def add_student(roll_no, name, section="A"):
+    """Add a student to the attendance register."""
+    students[roll_no] = {
+        "name": name,
+        "section": section,
+        "records": [],
+    }
+
+
+def mark_attendance(roll_no, date, status, register=None):
+    """Record attendance and return the daily register."""
+    if register is None:
+        register = {}
+
     register.setdefault(date, []).append(roll_no)
     students[roll_no]["records"].append((date, status))
     return register
 
-def attendancePercentage(roll_no):
+
+def attendance_percentage(roll_no):
+    """Calculate a student's attendance percentage."""
     records = students[roll_no]["records"]
-    present = len([r for r in records if r[1] == "P"])
-    total = len(records)
-    return int(present / total * 100)
+    if not records:
+        return 0
 
-def isEligible(percentage):
-    return True if percentage > MIN_ATTENDANCE else False
+    present = sum(1 for _, status in records if status == "P")
+    return int(present / len(records) * 100)
 
-def shortageList():
-    result = []
-    for roll_no in students:
-        if isEligible(attendancePercentage(roll_no)) == False:
-            result.append(roll_no)
-    if len(result) == 0:
+
+def is_eligible(percentage):
+    """Check whether attendance meets the minimum requirement."""
+    return percentage >= MIN_ATTENDANCE
+
+
+def shortage_list():
+    """Return students below the minimum attendance requirement."""
+    result = [
+        roll_no
+        for roll_no in students
+        if not is_eligible(attendance_percentage(roll_no))
+    ]
+    return result or None
+
+
+def has_long_absence(roll_no, days=3):
+    """Check for consecutive absences."""
+    if days <= 0:
+        return False
+
+    statuses = [
+        status for _, status in students[roll_no]["records"]
+    ]
+    return any(
+        statuses[index:index + days] == ["A"] * days
+        for index in range(len(statuses) - days + 1)
+    )
+
+
+def latest_date(roll_no):
+    """Return the latest attendance date, or None if no records exist."""
+    dates = [
+        date for date, _ in students[roll_no]["records"]
+    ]
+    if not dates:
         return None
-    return result
 
-def hasLongAbsence(roll_no, days=3):
-    statuses = [s for (d, s) in students[roll_no]["records"]]
-    return any([statuses[i:i + days] == ["A"] * days for i in range(len(statuses))])
+    return max(
+        dates,
+        key=lambda date: datetime.strptime(date, "%Y-%m-%d"),
+    )
 
-def latestDate(roll_no):
-    dates = [d for d in [r[0] for r in students[roll_no]["records"]]]
-    return max(dates)
 
-def exportCsv(path="attendance.csv"):
-    f = open(path, "w")
-    writer = csv.writer(f)
-    writer.writerow(["roll_no", "name", "percentage"])
-    for roll_no in students:
-        writer.writerow([roll_no, students[roll_no]["name"], attendancePercentage(roll_no)])
-    f.close()
+def safe_csv_value(value):
+    """Prevent spreadsheet formula execution in exported text values."""
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def export_csv(path="attendance.csv"):
+    """Export attendance percentages to a UTF-8 CSV file."""
+    with open(path, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["roll_no", "name", "percentage"])
+
+        for roll_no, student in students.items():
+            writer.writerow(
+                [
+                    safe_csv_value(roll_no),
+                    safe_csv_value(student["name"]),
+                    attendance_percentage(roll_no),
+                ]
+            )
+
     return path
 
-def syncToErp(roll_no):
-    payload = {"roll_no": roll_no, "pct": attendancePercentage(roll_no)}
-    response = requests.post(ERP_URL, json=payload, headers={"X-API-Key": ERP_API_KEY}, verify=False)
+
+def sync_to_erp(roll_no):
+    """Send attendance to the ERP service using a configured API key."""
+    api_key = os.environ.get("ERP_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set the ERP_API_KEY environment variable.")
+
+    payload = {
+        "roll_no": roll_no,
+        "pct": attendance_percentage(roll_no),
+    }
+    response = requests.post(
+        ERP_URL,
+        json=payload,
+        headers={"X-API-Key": api_key},
+        timeout=10,
+    )
+    response.raise_for_status()
     return response.status_code
 
-def backupReports():
-    subprocess.Popen("tar -czf reports_backup.tgz *.csv", shell=True)
 
-def legacyChannel(version=ssl.PROTOCOL_TLSv1):
-    return ssl.SSLContext(version)
+def backup_reports():
+    """Create a ZIP backup of CSV reports in the current directory."""
+    archive_name = "reports_backup.zip"
+    current_directory = os.path.abspath(".")
 
-def runJob(command, shell=False):
-    return {"command": command, "shell": shell}
+    with zipfile.ZipFile(
+        archive_name, "w", zipfile.ZIP_DEFLATED
+    ) as archive:
+        for filename in os.listdir(current_directory):
+            if filename.endswith(".csv"):
+                file_path = os.path.join(current_directory, filename)
+                archive.write(file_path, arcname=filename)
 
-def scheduleReminders():
-    return runJob("send_sms --shortage", shell=True)
+    return archive_name
+
+
+def run_job(command):
+    """Describe a command without invoking a system shell."""
+    if not isinstance(command, list) or not command:
+        raise ValueError("Command must be a non-empty list of arguments.")
+
+    return {"command": command, "shell": False}
+
+
+def schedule_reminders():
+    """Prepare a reminder command without executing it."""
+    return run_job(["send_sms", "--shortage"])
+
 
 def main():
-    addStudent("R01", "Aditi")
-    addStudent("R02", "=HYPERLINK(\"http://evil.example\",\"Bharat\")")
-    for date, status in [("2026-09-01", "P"), ("2026-09-02", "P"), ("2026-09-03", "L"),
-                         ("2026-09-04", "P"), ("2026-09-05", "H")]:
-        markAttendance("R01", date, status)
-    for date, status in [("2026-09-01", "P"), ("2026-09-01", "P"), ("2026-09-02", "A"),
-                         ("2026-09-03", "A"), ("2026-09-04", "A"), ("2026-9-3", "P")]:
-        markAttendance("R02", date, status)
-    register = markAttendance("R01", "2030-01-01", "P")
-    print("R01 attendance %:", attendancePercentage("R01"))
-    print("R02 attendance %:", attendancePercentage("R02"))
-    print("Is 75% eligible?", isEligible(75))
-    print("Shortage list:", shortageList())
-    print("R02 long absence?", hasLongAbsence("R02"))
-    print("R02 latest date:", latestDate("R02"))
+    """Run the attendance tracker demonstration."""
+    add_student("R01", "Aditi")
+    add_student("R02", '=HYPERLINK("http://evil.example","Bharat")')
+
+    register = {}
+
+    first_records = [
+        ("2026-09-01", "P"),
+        ("2026-09-02", "P"),
+        ("2026-09-03", "L"),
+        ("2026-09-04", "P"),
+        ("2026-09-05", "H"),
+    ]
+    for date, status in first_records:
+        mark_attendance("R01", date, status, register)
+
+    second_records = [
+        ("2026-09-01", "P"),
+        ("2026-09-01", "P"),
+        ("2026-09-02", "A"),
+        ("2026-09-03", "A"),
+        ("2026-09-04", "A"),
+        ("2026-09-03", "P"),
+    ]
+    for date, status in second_records:
+        mark_attendance("R02", date, status, register)
+
+    print("R01 attendance %:", attendance_percentage("R01"))
+    print("R02 attendance %:", attendance_percentage("R02"))
+    print("Is 75% eligible?", is_eligible(75))
+    print("Shortage list:", shortage_list())
+    print("R02 long absence?", has_long_absence("R02"))
+    print("R02 latest date:", latest_date("R02"))
     print("Register entries for 2026-09-01:", register["2026-09-01"])
-    print("Exported to:", exportCsv())
-    print("Reminder job:", scheduleReminders())
+    print("Exported to:", export_csv())
+    print("Reminder job:", schedule_reminders())
     print("ERP sync skipped (no network)")
 
-main()
+
+if __name__ == "__main__":
+    main()
